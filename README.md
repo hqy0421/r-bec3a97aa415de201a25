@@ -55,6 +55,11 @@ Then navigate to http://localhost:8080/ to view your database.
 * Import JSON or CSV files.
 * Browse table data.
 * Insert, Update or Delete rows.
+* Edit joined worksheets: correct a detail table and its referenced master
+  records side by side over any single-column foreign key (see the "Join"
+  tab or the index page). All detail rows are kept, only edited cells are
+  written, and each save applies detail and master changes in one
+  transaction.
 * Load and unload databases at run-time (see `--enable-load` or `--enable-filesystem`)
 
 ### Screenshots

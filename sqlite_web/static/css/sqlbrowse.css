@@ -142,6 +142,31 @@ td.cell-copied {
     to { background-color: transparent; }
 }
 
+/* Joined worksheet. Master columns are tinted so same-named columns keep
+   their origin visible; a cell the user edited stays highlighted until
+   the save comes back. */
+table.table-worksheet th.master-col,
+table.table-worksheet td.master-col {
+    background-color: #eef3f9;
+}
+table.table-worksheet tr.worksheet-side th {
+    border-bottom-width: 1px;
+}
+table.table-worksheet .wk-cell {
+    font-family: var(--font-family-monospace);
+    font-size: 12px;
+    height: auto;
+    min-width: 12ch;
+    padding: 1px 4px;
+}
+table.table-worksheet textarea.wk-cell {
+    min-width: 24ch;
+}
+table.table-worksheet .wk-cell.cell-dirty {
+    background-color: #fff3cd;
+    border-color: #e0a800;
+}
+
 /* Pagination. */
 ul.pagination .page-item .page-link {
     border-color: #aaaaaa !important;

@@ -1,6 +1,7 @@
 {% extends "base_tables.html" %}
 {% set is_view = dataset.cached_is_view(table) %}
 {% set view_ops = dataset.cached_view_operations(table) %}
+{% set ws_relations = dataset.cached_worksheet_relations(table) %}
 
 {% block content_title %}
   <a class="text-light" href="{{ url_for('table_structure', table=table) }}" title="{{ table }}">{{ table|truncate(40, True, leeway=2) }}</a>
@@ -17,6 +18,11 @@
     <li class="nav-item">
       <a class="nav-link{% block query_tab_class %}{% endblock %}" href="{{ url_for('table_query', table=table) }}">Query</a>
     </li>
+    {% if ws_relations %}
+    <li class="nav-item">
+      <a class="nav-link{% block join_tab_class %}{% endblock %}" href="{{ url_for('table_worksheet', table=table, fk_column=ws_relations[0].fk_column) if ws_relations|length == 1 else url_for('worksheet_index', table=table) }}">Join</a>
+    </li>
+    {% endif %}
     {% if not dataset.is_readonly and (not is_view or 'insert' in view_ops) %}
     <li class="nav-item">
       <a class="nav-link{% block insert_tab_class %}{% endblock %}" href="{{ url_for('table_insert', table=table) }}">Insert</a>

@@ -152,10 +152,12 @@ App = window.App || {};
         }
 
         /* Double-click a cell to copy its value. No overlay chrome to
-           collide with the data, the cell flashes as feedback. */
+           collide with the data, the cell flashes as feedback. Worksheet
+           edit inputs are excluded, double-click there selects text. */
         $('table.cell-content').on('dblclick', 'tbody td', function() {
             var td = $(this);
-            if (td.find('input.toggle-pk').length || td.find('a.copy-row').length) {
+            if (td.find('input.toggle-pk').length || td.find('a.copy-row').length ||
+                td.find('.wk-cell').length) {
                 return;
             }
             var data = cellData(td);
@@ -193,6 +195,23 @@ App = window.App || {};
                 setTimeout(function() { use.attr('href', '#i-copy'); }, 800);
             });
         });
+
+        /* Joined worksheet: a cell counts as edited only once the user
+           types in it (or the server re-renders it dirty after a failed
+           save). On submit, untouched cells are disabled so they are not
+           sent, which keeps the server from ever rewriting values the
+           user did not change. The stamp ships disabled and is enabled
+           here, so a JS-less browser cannot submit the grid at all. */
+        var worksheetCells = $('table.table-worksheet .wk-cell');
+        if (worksheetCells.length) {
+            $('form#worksheet-save input[name="stamp"]').prop('disabled', false);
+            worksheetCells.on('input', function() {
+                $(this).attr('data-dirty', '1').addClass('cell-dirty');
+            });
+            $('form#worksheet-save').on('submit', function() {
+                worksheetCells.not('[data-dirty]').prop('disabled', true);
+            });
+        }
 
         /* Initialize focus on SQL textarea. */
         var sqlTextarea = $('textarea#sql, textarea#table-sql');

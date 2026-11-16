@@ -1,0 +1,48 @@
+{% extends "base_tables.html" %}
+
+{% block content %}
+  <h3>Joined worksheets</h3>
+  <p class="small text-muted">
+    Edit a detail table together with the master record each row references. Every worksheet
+    follows one foreign key; all detail rows are kept, master columns stay read-only for rows
+    without a matching master record, and master records are never created from here.
+  </p>
+  {% if only_table %}
+    <p><a href="{{ url_for('worksheet_index') }}">Show relationships for all tables</a></p>
+  {% endif %}
+  {% if relations %}
+  <table class="table table-sm w-auto">
+    <thead>
+      <tr>
+        <th>Detail table</th>
+        <th>Foreign key</th>
+        <th>Master</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in relations %}
+        {% set rel = item.relation %}
+        <tr>
+          <td><a href="{{ url_for('table_content', table=rel.detail_table) }}">{{ rel.detail_table }}</a></td>
+          <td><code>{{ rel.fk_column }}</code></td>
+          <td><code>{{ rel.master_table }}.{{ rel.master_column }}</code></td>
+          <td>
+            {% if item.detail_pk %}
+              <a class="btn btn-sm btn-primary" href="{{ url_for('table_worksheet', table=rel.detail_table, fk_column=rel.fk_column) }}">Open worksheet</a>
+            {% else %}
+              <span class="text-muted small">needs a usable primary key on {{ rel.detail_table }}</span>
+            {% endif %}
+            {% if not item.master_pk %}<span class="badge badge-secondary ml-1">master read-only</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p>
+      No foreign-key relationships found{% if only_table %} on {{ only_table }}{% endif %}.
+      Define a single-column foreign key between two tables to edit them as a worksheet.
+    </p>
+  {% endif %}
+{% endblock %}

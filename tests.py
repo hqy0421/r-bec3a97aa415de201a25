@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -972,6 +973,374 @@ class TestContentTab(BaseAppTestCase):
                             follow_redirects=True)
         self.assertIn(b'alert-dismissible', r.data)
         self.assertNotIn(b'alert-dismissable', r.data)
+
+
+class TestWorksheet(BaseAppTestCase):
+    """Joined worksheet: edit a detail table and its master records."""
+
+    def dbwrite(self, sql, *params):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(sql, params)
+        conn.commit()
+        conn.close()
+
+    def get_stamp(self, url):
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        m = re.search(b'name="stamp"[^>]*value="([0-9a-f]+)"', r.data)
+        self.assertIsNotNone(m)
+        return m.group(1).decode(), r.data
+
+    def row_index(self, html, token):
+        m = re.search(b'name="k\\.(\\d+)"[^>]*value="%s"' %
+                      re.escape(token.encode()), html)
+        self.assertIsNotNone(m)
+        return int(m.group(1))
+
+    def master_key(self, html, n):
+        # The hidden master-row token the browser submits for row n.
+        m = re.search(b'name="mk\\.%d"[^>]*value="([^"]+)"' % n, html)
+        self.assertIsNotNone(m)
+        return m.group(1).decode()
+
+    # Column indexes in the child->parent worksheet select-list.
+    # child: id=0, parent_id=1, label=2; parent: id=3, name=4.
+    def test_chooser_lists_relations(self):
+        r = self.client.get('/worksheet/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'/child/worksheet/parent_id/', r.data)
+        self.assertIn(b'/post/worksheet/tag/', r.data)
+        self.assertIn(b'parent.id', r.data)
+        self.assertIn(b'tag.name', r.data)
+        # Tables without foreign keys offer no worksheet.
+        self.assertNotIn(b'/users/worksheet/', r.data)
+
+    def test_chooser_filters_by_table(self):
+        r = self.client.get('/worksheet/', query_string={'table': 'child'})
+        self.assertIn(b'/child/worksheet/parent_id/', r.data)
+        self.assertNotIn(b'/post/worksheet/tag/', r.data)
+        r = self.client.get('/worksheet/', query_string={'table': 'parent'})
+        self.assertNotIn(b'Open worksheet', r.data)
+
+    def test_join_tab_appears_only_with_relations(self):
+        self.assertIn(b'/child/worksheet/parent_id/',
+                      self.client.get('/child/').data)
+        self.assertNotIn(b'worksheet', self.client.get('/users/').data)
+
+    def test_grid_keeps_all_detail_rows_and_labels_sources(self):
+        self.dbwrite("INSERT INTO child (parent_id, label) "
+                     "VALUES (NULL, 'orphan')")
+        _, html = self.get_stamp('/child/worksheet/parent_id/')
+        # LEFT JOIN keeps the detail row that has no master.
+        self.assertIn(b'c-one', html)
+        self.assertIn(b'orphan', html)
+        # Same-named columns are labeled by their source table.
+        self.assertIn(b'Detail: child', html)
+        self.assertIn(b'Master: parent', html)
+        self.assertIn(b'title="child.id"', html)
+        self.assertIn(b'title="parent.id"', html)
+        self.assertIn(b'title="child.label"', html)
+        self.assertIn(b'title="parent.name"', html)
+
+    def test_orphan_master_cells_not_editable_and_never_created(self):
+        self.dbwrite("INSERT INTO child (parent_id, label) "
+                     "VALUES (NULL, 'orphan')")
+        stamp, html = self.get_stamp('/child/worksheet/parent_id/')
+        # Only the row with a matching master carries a master key.
+        self.assertEqual(html.count(b'name="mk.'), 1)
+        n_orphan = self.row_index(html, key_encode([2]))
+        # A crafted master cell for the masterless row is ignored.
+        r = self.client.post('/child/worksheet/parent_id/', data={
+            'stamp': stamp,
+            'k.%d' % n_orphan: key_encode([2]),
+            'c.%d.4' % n_orphan: 'hacked',
+        })
+        self.assertIn(r.status_code, (302, 303))
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM parent')[0][0], 1)
+        self.assertEqual(
+            self.dbrows("SELECT COUNT(*) FROM parent WHERE name = 'hacked'"),
+            [(0,)])
+
+    def test_edit_detail_cell_writes_only_detail_row(self):
+        stamp, html = self.get_stamp('/child/worksheet/parent_id/')
+        n = self.row_index(html, key_encode([1]))
+        r = self.client.post('/child/worksheet/parent_id/', data={
+            'stamp': stamp, 'k.%d' % n: key_encode([1]),
+            'c.%d.2' % n: 'c-one-fixed',
+        })
+        self.assertIn(r.status_code, (302, 303))
+        self.assertEqual(self.dbrows('SELECT label FROM child WHERE id = 1'),
+                         [('c-one-fixed',)])
+        # The master record is untouched by a detail-side edit.
+        self.assertEqual(self.dbrows('SELECT name FROM parent WHERE id = 1'),
+                         [('p-one',)])
+
+    def test_edit_master_cell_shared_record_visible_after_refresh(self):
+        self.dbwrite("INSERT INTO child (parent_id, label) VALUES (1, 'c-two')")
+        stamp, html = self.get_stamp('/child/worksheet/parent_id/')
+        n = self.row_index(html, key_encode([1]))
+        r = self.client.post('/child/worksheet/parent_id/', data={
+            'stamp': stamp, 'k.%d' % n: key_encode([1]),
+            'mk.%d' % n: self.master_key(html, n),
+            'c.%d.4' % n: 'p-renamed',
+        })
+        self.assertIn(r.status_code, (302, 303))
+        self.assertEqual(self.dbrows('SELECT name FROM parent WHERE id = 1'),
+                         [('p-renamed',)])
+        # Every row referencing the same master shows the new value.
+        _, html = self.get_stamp('/child/worksheet/parent_id/')
+        self.assertGreaterEqual(html.count(b'p-renamed'), 2)
+
+    def test_master_conflict_rejected(self):
+        self.dbwrite("INSERT INTO child (parent_id, label) VALUES (1, 'c-two')")
+        stamp, html = self.get_stamp('/child/worksheet/parent_id/')
+        n1 = self.row_index(html, key_encode([1]))
+        n2 = self.row_index(html, key_encode([2]))
+        r = self.client.post('/child/worksheet/parent_id/', data={
+            'stamp': stamp,
+            'k.%d' % n1: key_encode([1]), 'c.%d.4' % n1: 'aaa',
+            'mk.%d' % n1: self.master_key(html, n1),
+            'k.%d' % n2: key_encode([2]), 'c.%d.4' % n2: 'bbb',
+            'mk.%d' % n2: self.master_key(html, n2),
+        })
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'Conflict', r.data)
+        self.assertEqual(self.dbrows('SELECT name FROM parent WHERE id = 1'),
+                         [('p-one',)])
+
+    def test_pk_and_join_key_are_read_only(self):
+        _, html = self.get_stamp('/child/worksheet/parent_id/')
+        # No inputs exist for child.id, child.parent_id or parent.id.
+        for idx in (0, 1, 3):
+            self.assertIsNone(
+                re.search(b'name="c\\.\\d+\\.%d"' % idx, html), idx)
+        # A crafted post targeting them is ignored.
+        stamp, _ = self.get_stamp('/child/worksheet/parent_id/')
+        n = self.row_index(html, key_encode([1]))
+        self.client.post('/child/worksheet/parent_id/', data={
+            'stamp': stamp, 'k.%d' % n: key_encode([1]),
+            'c.%d.0' % n: '99', 'c.%d.1' % n: '7', 'c.%d.3' % n: '42',
+        })
+        self.assertEqual(
+            self.dbrows('SELECT id, parent_id FROM child WHERE id = 1'),
+            [(1, 1)])
+        self.assertEqual(self.dbrows('SELECT id FROM parent'), [(1,)])
+
+    def test_stale_stamp_refused(self):
+        n_html = self.client.get('/child/worksheet/parent_id/').data
+        n = self.row_index(n_html, key_encode([1]))
+        r = self.client.post('/child/worksheet/parent_id/', data={
+            'stamp': '0' * 64, 'k.%d' % n: key_encode([1]),
+            'c.%d.2' % n: 'nope',
+        }, follow_redirects=True)
+        self.assertIn(b'out of date', r.data)
+        self.assertEqual(self.dbrows('SELECT label FROM child WHERE id = 1'),
+                         [('c-one',)])
+
+    def test_missing_stamp_refused(self):
+        # The stamp input ships disabled and JS enables it, so a JS-less
+        # browser submits no stamp and the save is refused outright.
+        html = self.client.get('/child/worksheet/parent_id/').data
+        self.assertIn(b'name="stamp" type="hidden"', html)
+        n = self.row_index(html, key_encode([1]))
+        r = self.client.post('/child/worksheet/parent_id/', data={
+            'k.%d' % n: key_encode([1]), 'c.%d.2' % n: 'nope',
+        }, follow_redirects=True)
+        self.assertIn(b'requires JavaScript', r.data)
+        self.assertEqual(self.dbrows('SELECT label FROM child WHERE id = 1'),
+                         [('c-one',)])
+
+    def test_schema_change_invalidates_stamp(self):
+        stamp1, _ = self.get_stamp('/child/worksheet/parent_id/')
+        self.dbwrite('ALTER TABLE child ADD COLUMN extra TEXT')
+        stamp2, html = self.get_stamp('/child/worksheet/parent_id/')
+        self.assertNotEqual(stamp1, stamp2)
+        self.assertIn(b'extra', html)  # The new column shows up.
+        n = self.row_index(html, key_encode([1]))
+        r = self.client.post('/child/worksheet/parent_id/', data={
+            'stamp': stamp1, 'k.%d' % n: key_encode([1]),
+            'c.%d.2' % n: 'nope',
+        }, follow_redirects=True)
+        self.assertIn(b'out of date', r.data)
+        self.assertEqual(self.dbrows('SELECT label FROM child WHERE id = 1'),
+                         [('c-one',)])
+
+    def test_constraint_error_rolls_back_everything(self):
+        self.dbwrite('CREATE TABLE cust (id INTEGER PRIMARY KEY, '
+                     'name TEXT NOT NULL UNIQUE)')
+        self.dbwrite('CREATE TABLE ord (id INTEGER PRIMARY KEY, '
+                     'cust_id INTEGER REFERENCES cust, note TEXT)')
+        self.dbwrite("INSERT INTO cust VALUES (1, 'alice'), (2, 'bob')")
+        self.dbwrite("INSERT INTO ord VALUES (1, 1, 'first')")
+        # ord: id=0, cust_id=1, note=2; cust: id=3, name=4.
+        stamp, html = self.get_stamp('/ord/worksheet/cust_id/')
+        n = self.row_index(html, key_encode([1]))
+        r = self.client.post('/ord/worksheet/cust_id/', data={
+            'stamp': stamp, 'k.%d' % n: key_encode([1]),
+            'mk.%d' % n: self.master_key(html, n),
+            'c.%d.2' % n: 'first-edited',  # Detail edit...
+            'c.%d.4' % n: 'bob',  # ...plus a master edit that violates UNIQUE.
+        })
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'rolled back', r.data)
+        # The detail edit was rolled back together with the failing master.
+        self.assertEqual(self.dbrows('SELECT note FROM ord WHERE id = 1'),
+                         [('first',)])
+        self.assertEqual(self.dbrows('SELECT name FROM cust WHERE id = 1'),
+                         [('alice',)])
+
+    def test_null_text_null_blob_and_bigint_keep_meaning(self):
+        self.dbwrite('CREATE TABLE m (id INTEGER PRIMARY KEY, '
+                     'note TEXT, data BLOB)')
+        self.dbwrite('CREATE TABLE d (id INTEGER PRIMARY KEY, '
+                     'mid INTEGER REFERENCES m, big INTEGER)')
+        self.dbwrite('INSERT INTO m VALUES (1, NULL, ?)', b'\x00\xff')
+        self.dbwrite("INSERT INTO m VALUES (2, 'NULL', ?)", b'\x01\x02')
+        self.dbwrite('INSERT INTO d VALUES (1, 1, 9223372036854775807)')
+        self.dbwrite('INSERT INTO d VALUES (2, 2, 4611686018427387904)')
+        # d: id=0, mid=1, big=2; m: id=3, note=4, data=5.
+        stamp, html = self.get_stamp('/d/worksheet/mid/')
+        self.assertIn(b'9223372036854775807', html)  # Big int rendered in full.
+        self.assertIn(b'00ff', html)  # Blob rendered as hex.
+        n1 = self.row_index(html, key_encode([1]))
+        n2 = self.row_index(html, key_encode([2]))
+        # Edit only the bigint cell of row 1; nothing else may change.
+        r = self.client.post('/d/worksheet/mid/', data={
+            'stamp': stamp, 'k.%d' % n1: key_encode([1]),
+            'c.%d.2' % n1: '1111111111111111111',
+        })
+        self.assertIn(r.status_code, (302, 303))
+        self.assertEqual(self.dbrows('SELECT big FROM d WHERE id = 1'),
+                         [(1111111111111111111,)])
+        self.assertEqual(self.dbrows('SELECT big FROM d WHERE id = 2'),
+                         [(4611686018427387904,)])
+        self.assertEqual(self.dbrows('SELECT note, data FROM m WHERE id = 1'),
+                         [(None, b'\x00\xff')])
+        # The text "NULL" was not touched, so it stays text, not SQL NULL.
+        self.assertEqual(self.dbrows('SELECT note, data FROM m WHERE id = 2'),
+                         [('NULL', b'\x01\x02')])
+        # Typing NULL still means SQL NULL, and blobs round-trip as hex.
+        r = self.client.post('/d/worksheet/mid/', data={
+            'stamp': stamp, 'k.%d' % n2: key_encode([2]),
+            'mk.%d' % n2: self.master_key(html, n2),
+            'c.%d.4' % n2: 'NULL', 'c.%d.5' % n2: 'ff00',
+        })
+        self.assertIn(r.status_code, (302, 303))
+        self.assertEqual(self.dbrows('SELECT note, data FROM m WHERE id = 2'),
+                         [(None, b'\xff\x00')])
+
+    def test_row_deleted_between_render_and_post_rolls_back(self):
+        self.dbwrite("INSERT INTO child (parent_id, label) VALUES (1, 'c-two')")
+        stamp, html = self.get_stamp('/child/worksheet/parent_id/')
+        n1 = self.row_index(html, key_encode([1]))
+        self.dbwrite('DELETE FROM child WHERE id = 1')
+        r = self.client.post('/child/worksheet/parent_id/', data={
+            'stamp': stamp,
+            'k.%d' % n1: key_encode([1]), 'c.%d.2' % n1: 'gone',
+            'k.99': key_encode([2]), 'c.99.2': 'also-edited',
+        }, follow_redirects=True)
+        self.assertIn(b'changed or removed', r.data)
+        # The surviving row's edit was rolled back with the stale one.
+        self.assertEqual(self.dbrows('SELECT label FROM child WHERE id = 2'),
+                         [('c-two',)])
+
+    def test_text_primary_key_master(self):
+        self.dbwrite("INSERT INTO post (tag, body) VALUES ('red', 'hello')")
+        self.dbwrite("INSERT INTO post (tag, body) VALUES ('', 'empty-tag')")
+        # post: id=0, tag=1, body=2; tag: name=3 (the pk, read-only).
+        stamp, html = self.get_stamp('/post/worksheet/tag/')
+        self.assertIn(b'hello', html)
+        # Both posts match a master (tag '' and 'red' exist).
+        self.assertEqual(html.count(b'name="mk.'), 2)
+        # The master pk column renders read-only: no input for index 3.
+        self.assertIsNone(re.search(b'name="c\\.\\d+\\.3"', html))
+        n = self.row_index(html, key_encode([1]))
+        r = self.client.post('/post/worksheet/tag/', data={
+            'stamp': stamp, 'k.%d' % n: key_encode([1]),
+            'c.%d.2' % n: 'hello2',
+        })
+        self.assertIn(r.status_code, (302, 303))
+        self.assertEqual(self.dbrows('SELECT body FROM post WHERE id = 1'),
+                         [('hello2',)])
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM tag'), [(2,)])
+
+    def test_self_referencing_foreign_key(self):
+        self.dbwrite('CREATE TABLE emp (id INTEGER PRIMARY KEY, '
+                     'mgr INTEGER REFERENCES emp(id), name TEXT)')
+        self.dbwrite("INSERT INTO emp VALUES (1, NULL, 'boss'), "
+                     "(2, 1, 'worker')")
+        # emp: id=0, mgr=1, name=2; master emp: id=3, mgr=4, name=5.
+        stamp, html = self.get_stamp('/emp/worksheet/mgr/')
+        # Same table on both sides: the source label appears twice.
+        self.assertEqual(html.count(b'title="emp.name"'), 2)
+        n = self.row_index(html, key_encode([2]))
+        r = self.client.post('/emp/worksheet/mgr/', data={
+            'stamp': stamp, 'k.%d' % n: key_encode([2]),
+            'mk.%d' % n: self.master_key(html, n),
+            'c.%d.5' % n: 'bigboss',
+        })
+        self.assertIn(r.status_code, (302, 303))
+        self.assertEqual(self.dbrows('SELECT name FROM emp WHERE id = 1'),
+                         [('bigboss',)])
+        self.assertEqual(self.dbrows('SELECT name FROM emp WHERE id = 2'),
+                         [('worker',)])
+
+    def test_missing_relation_redirects_to_chooser(self):
+        for url in ('/users/worksheet/x/', '/child/worksheet/nope/'):
+            r = self.client.get(url)
+            self.assertIn(r.status_code, (302, 303), url)
+            self.assertIn('/worksheet/', r.headers['Location'])
+
+    def test_composite_foreign_key_not_offered(self):
+        self.dbwrite('CREATE TABLE cfk (a TEXT, b TEXT, '
+                     'FOREIGN KEY (a, b) REFERENCES comp(a, b))')
+        r = self.client.get('/worksheet/')
+        # The table exists (sidebar lists it) but gets no worksheet.
+        self.assertNotIn(b'/cfk/worksheet/', r.data)
+
+    def test_detail_table_without_pk_redirects(self):
+        self.dbwrite('CREATE TABLE npd (pid INTEGER REFERENCES parent, '
+                     'note TEXT)')
+        r = self.client.get('/worksheet/')
+        self.assertIn(b'needs a usable primary key', r.data)
+        r = self.client.get('/npd/worksheet/pid/')
+        self.assertIn(r.status_code, (302, 303))
+        self.assertIn('/worksheet/', r.headers['Location'])
+
+    def test_ordering_and_pagination_smoke(self):
+        for query in ({'ordering': '2'}, {'ordering': '-3'},
+                      {'ordering': '99'}, {'page': '1'}, {'ordering': 'x'}):
+            r = self.client.get('/child/worksheet/parent_id/',
+                                query_string=query)
+            self.assertEqual(r.status_code, 200, query)
+
+
+class TestWorksheetReadOnly(BaseAppTestCase):
+    def setUp(self):
+        super().setUp()
+        sw.datasets.clear()
+        sw.initialize_app([self.db_path], read_only=True)
+        self.client = sw.app.test_client()
+
+    def tearDown(self):
+        super().tearDown()
+        sw.dataset_config['read_only'] = False
+
+    def test_grid_is_browse_only(self):
+        r = self.client.get('/child/worksheet/parent_id/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'c-one', r.data)
+        self.assertNotIn(b'wk-cell', r.data)
+        self.assertNotIn(b'worksheet-save', r.data)
+        self.assertIn(b'read-only', r.data)
+
+    def test_post_is_refused(self):
+        r = self.client.post('/child/worksheet/parent_id/', data={
+            'stamp': 'whatever', 'k.0': key_encode([1]), 'c.0.2': 'nope',
+        }, follow_redirects=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.dbrows('SELECT label FROM child WHERE id = 1'),
+                         [('c-one',)])
 
 
 class TestUrlPrefix(BaseAppTestCase):

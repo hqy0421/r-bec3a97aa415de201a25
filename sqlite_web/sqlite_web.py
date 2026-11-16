@@ -114,6 +114,23 @@ TriggerMetadata = namedtuple('TriggerMetadata', ('name', 'sql'))
 ViewMetadata = namedtuple('ViewMetadata', ('name', 'sql'))
 
 #
+# Joined-worksheet metadata objects.
+#
+
+# One editable detail->master relationship, derived from a single-column
+# foreign key on the detail table.
+WorksheetRelation = namedtuple('WorksheetRelation', (
+    'detail_table', 'fk_column', 'master_table', 'master_column'))
+
+# One column in the worksheet select-list. side is 'd' (detail) or 'm'
+# (master); index is the positional select alias ("c<index>").
+WorksheetColumn = namedtuple('WorksheetColumn', (
+    'side', 'index', 'table', 'column', 'field', 'editable'))
+
+class WorksheetStale(Exception):
+    """A row targeted by a worksheet save no longer exists."""
+
+#
 # Database helpers.
 #
 
@@ -163,6 +180,38 @@ class SqliteDataSet(DataSet):
             return {fk.column: (fk.dest_table, fk.dest_column)
                     for fk in self.cached_foreign_keys(table)}
         return self._cached(('fk_lookup', table), build)
+
+    def cached_worksheet_relations(self, table):
+        # Single-column foreign keys, the only joins a worksheet can
+        # target unambiguously. Composite foreign keys, dangling
+        # references and views are not offered.
+        def build():
+            if self.cached_is_view(table):
+                return []
+            cursor = self.query(
+                'PRAGMA foreign_key_list(%s)' % quote_ident(table))
+            groups = {}
+            for row in cursor.fetchall():
+                # (id, seq, table, from, to, on_update, on_delete, match)
+                groups.setdefault(row[0], []).append(row)
+            relations = []
+            for rows in groups.values():
+                if len(rows) != 1:
+                    continue
+                _, _, dest_table, from_col, to_col = rows[0][:5]
+                if dest_table not in self.cached_tables():
+                    continue
+                if to_col is None:
+                    # REFERENCES t with no column implies t's primary key.
+                    pk_cols = [c.name for c in self.get_columns(dest_table)
+                               if c.primary_key]
+                    if len(pk_cols) != 1:
+                        continue
+                    to_col = pk_cols[0]
+                relations.append(WorksheetRelation(
+                    table, from_col, dest_table, to_col))
+            return sorted(relations, key=lambda r: r.fk_column)
+        return self._cached(('worksheet_relations', table), build)
 
     def cached_has_usable_pk(self, table):
         def check():
@@ -1296,6 +1345,347 @@ def table_row_detail(table, pk):
         row=row,
         table=table,
         table_pk=table_pk)
+
+#
+# Joined worksheet: edit a detail table and its referenced master records
+# side by side. The grid is a LEFT JOIN over one foreign key, so every
+# detail row is kept; master cells are read-only when no master matches
+# and are never auto-created. Only edited cells are submitted, detail and
+# master edits for a submission save in one transaction or not at all.
+#
+
+def _worksheet_columns(dataset, relation, allow_edit):
+    detail_model = dataset[relation.detail_table].model_class
+    master_model = dataset[relation.master_table].model_class
+    master_pk_ok = dataset.cached_has_usable_pk(relation.master_table)
+    columns = []
+    for side, table, model in (
+            ('d', relation.detail_table, detail_model),
+            ('m', relation.master_table, master_model)):
+        for column in dataset.get_columns(table):
+            field = model._meta.columns[column.name]
+            if side == 'd':
+                editable = (allow_edit and not column.primary_key and
+                            column.name != relation.fk_column)
+            else:
+                editable = (allow_edit and master_pk_ok and
+                            not column.primary_key and
+                            column.name != relation.master_column)
+            columns.append(WorksheetColumn(
+                side, len(columns), table, column, field, editable))
+    return columns, detail_model, master_model, master_pk_ok
+
+def _worksheet_sql(relation, columns):
+    # Positional aliases ("c0", "c1", ...) keep same-named and oddly-named
+    # columns unambiguous; the Python-side column list maps them back.
+    select = ', '.join(
+        '%s.%s AS %s' % (meta.side, quote_ident(meta.column.name),
+                         quote_ident('c%d' % meta.index))
+        for meta in columns)
+    return 'SELECT %s FROM %s AS d LEFT JOIN %s AS m ON d.%s = m.%s' % (
+        select,
+        quote_ident(relation.detail_table),
+        quote_ident(relation.master_table),
+        quote_ident(relation.fk_column),
+        quote_ident(relation.master_column))
+
+def _worksheet_pk_positions(columns, model, side):
+    pk = model._meta.primary_key
+    names = pk.field_names if isinstance(pk, CompositeKey) else [pk.name]
+    positions = []
+    for name in names:
+        for meta in columns:
+            if meta.side == side and meta.field.name == name:
+                positions.append(meta.index)
+                break
+        else:
+            return None
+    return positions
+
+def _worksheet_edit_value(field, value):
+    if value is None:
+        return 'NULL'
+    if isinstance(field, BlobField) and \
+            isinstance(value, (bytes, bytearray, memoryview)):
+        data = bytes(value)
+        if app.config['BLOB_AS_BASE64']:
+            return base64.b64encode(data).decode('utf8')
+        return data.hex()
+    return str(value)
+
+def _worksheet_stamp(dataset, relation):
+    # Everything a stale page must not write across: which database, which
+    # relationship, the schema itself and the config that changes how
+    # values are interpreted. Checked before any write.
+    parts = [
+        dataset.filename,
+        relation.detail_table, relation.fk_column,
+        relation.master_table, relation.master_column,
+        str(dataset._database.pragma('schema_version')),
+        ','.join(c.name for c in dataset.get_columns(relation.detail_table)),
+        ','.join(c.name for c in dataset.get_columns(relation.master_table)),
+        'base64' if app.config['BLOB_AS_BASE64'] else 'hex',
+        'ro' if dataset.is_readonly else 'rw',
+    ]
+    return hashlib.sha256('\x1f'.join(parts).encode('utf8')).hexdigest()
+
+def _same_db_value(field, a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    try:
+        return field.db_value(a) == field.db_value(b)
+    except Exception:
+        return a == b
+
+def _worksheet_grid(dataset, relation, columns, detail_model, master_model,
+                    page, ordering):
+    sql = _worksheet_sql(relation, columns)
+    total, = dataset.query(wrap(sql, select='COUNT(*)')).fetchone()
+    rpp = app.config['ROWS_PER_PAGE']
+    total_pages = max(1, int(math.ceil(total / float(rpp))))
+    page = max(min(page, total_pages), 1)
+    cursor = dataset.query(wrap(sql, ordering, rpp, (page - 1) * rpp))
+
+    d_pos = _worksheet_pk_positions(columns, detail_model, 'd')
+    m_pos = _worksheet_pk_positions(columns, master_model, 'm')
+    rows = []
+    for raw in cursor.fetchall():
+        mkey = None
+        if m_pos is not None:
+            mvals = [raw[p] for p in m_pos]
+            if all(v is not None for v in mvals):
+                mkey = key_encode(mvals)
+        cells = []
+        for meta in columns:
+            value = raw[meta.index]
+            editable = meta.editable and (meta.side == 'd' or
+                                          mkey is not None)
+            cells.append({
+                'value': value,
+                'editable': editable,
+                'edit': (_worksheet_edit_value(meta.field, value)
+                         if editable else None),
+            })
+        rows.append({
+            'key': key_encode([raw[p] for p in d_pos]),
+            'mkey': mkey,
+            'cells': cells,
+        })
+    return {
+        'next_page': page + 1 if page < total_pages else None,
+        'page': page,
+        'previous_page': page - 1 if page > 1 else None,
+        'rows': rows,
+        'stamp': _worksheet_stamp(dataset, relation),
+        'total_pages': total_pages,
+        'total_rows': total,
+    }
+
+@app.route('/worksheet/')
+def worksheet_index():
+    dataset = get_dataset()
+    dataset.ensure_cache()
+    only_table = request.args.get('table')
+    relations = []
+    for table in sorted(dataset.cached_tables()):
+        if only_table and table != only_table:
+            continue
+        for relation in dataset.cached_worksheet_relations(table):
+            relations.append({
+                'relation': relation,
+                'detail_pk': dataset.cached_has_usable_pk(
+                    relation.detail_table),
+                'master_pk': dataset.cached_has_usable_pk(
+                    relation.master_table),
+            })
+    return render_template(
+        'worksheet_index.html',
+        only_table=only_table,
+        relations=relations)
+
+@app.route('/<table>/worksheet/<path:fk_column>/', methods=['GET', 'POST'])
+@require_table
+def table_worksheet(table, fk_column):
+    dataset = get_dataset()
+    dataset.ensure_cache()
+    relation = None
+    for candidate in dataset.cached_worksheet_relations(table):
+        if candidate.fk_column == fk_column:
+            relation = candidate
+            break
+    if relation is None:
+        flash('The relationship "%s.%s" no longer exists. The page may be '
+              'out of date; choose a current relationship below.' %
+              (table, fk_column), 'warning')
+        return redirect(url_for('worksheet_index', table=table))
+    if not dataset.cached_has_usable_pk(table):
+        flash('Table "%s" needs a usable primary key to edit a joined '
+              'worksheet.' % table, 'warning')
+        return redirect(url_for('worksheet_index', table=table))
+
+    allow_edit = not dataset.is_readonly
+    columns, detail_model, master_model, master_pk_ok = _worksheet_columns(
+        dataset, relation, allow_edit)
+
+    try:
+        ordering = int(request.values.get('ordering') or 0) or None
+    except ValueError:
+        ordering = None
+    if ordering is not None and not 0 < abs(ordering) <= len(columns):
+        ordering = None
+    page = request.values.get('page') or ''
+    page = max(int(page), 1) if page.isdigit() else 1
+
+    def worksheet_url():
+        kw = {}
+        if page != 1:
+            kw['page'] = page
+        if ordering:
+            kw['ordering'] = ordering
+        return url_for('table_worksheet', table=table, fk_column=fk_column,
+                       **kw)
+
+    submitted = {}
+    errors = {}
+    if request.method == 'POST':
+        if not allow_edit:
+            flash('This database is read-only.', 'warning')
+            return redirect(worksheet_url())
+        stamp = request.form.get('stamp')
+        if stamp is None:
+            # The stamp input ships disabled and JS enables it; without JS
+            # every cell would submit and untouched values (a text "NULL",
+            # say) could be rewritten. Refuse instead.
+            flash('Editing a worksheet requires JavaScript, same as the '
+                  'row editor.', 'warning')
+            return redirect(worksheet_url())
+        if stamp != _worksheet_stamp(dataset, relation):
+            flash('This worksheet is out of date: the database, its '
+                  'schema, or this relationship changed since the page '
+                  'loaded. Nothing was saved; review the reloaded '
+                  'worksheet and try again.', 'danger')
+            return redirect(worksheet_url())
+
+        cell_re = re.compile(r'^c\.(\d+)\.(\d+)$')
+        row_keys = {}
+        master_keys = {}
+        raw_cells = {}
+        for key, value in request.form.items():
+            match = cell_re.match(key)
+            if match:
+                raw_cells[(int(match.group(1)), int(match.group(2)))] = value
+            elif key.startswith('k.'):
+                try:
+                    row_keys[int(key[2:])] = value
+                except ValueError:
+                    pass
+            elif key.startswith('mk.'):
+                try:
+                    master_keys[int(key[3:])] = value
+                except ValueError:
+                    pass
+
+        by_row = {}
+        for (n, i), value in raw_cells.items():
+            by_row.setdefault(n, []).append((i, value))
+        col_by_index = {meta.index: meta for meta in columns}
+
+        detail_updates = []
+        # Master edits are grouped by master row key: several detail rows
+        # may reference one master record, and it is written at most once.
+        master_updates = OrderedDict()
+        for n in sorted(by_row):
+            token = row_keys.get(n)
+            if token is None:
+                continue  # A cell without its row key cannot be targeted.
+            m_token = master_keys.get(n)
+            update = {}
+            for i, raw in sorted(by_row[n]):
+                meta = col_by_index.get(i)
+                if meta is None:
+                    continue
+                submitted.setdefault(n, {})[i] = raw
+                if not meta.editable or (meta.side == 'm' and not m_token):
+                    # Read-only column, or a master cell for a row with no
+                    # master record. Never auto-create the master.
+                    continue
+                value, err = minimal_validate_field(meta.field, raw)
+                if err:
+                    errors.setdefault(n, {})[i] = err
+                elif meta.side == 'd':
+                    update[meta.field] = value
+                else:
+                    per = master_updates.setdefault(m_token, OrderedDict())
+                    previous = per.get(meta.field.name)
+                    if previous is not None and not _same_db_value(
+                            meta.field, previous[1], value):
+                        errors.setdefault(n, {})[i] = (
+                            'Conflicts with another row editing the same '
+                            'master record.')
+                    else:
+                        per[meta.field.name] = (meta.field, value)
+            if update:
+                detail_updates.append((token, update))
+
+        if errors:
+            flash('One or more values could not be validated; nothing was '
+                  'saved.', 'danger')
+        elif not detail_updates and not master_updates:
+            flash('No edited cells were submitted.', 'info')
+            return redirect(worksheet_url())
+        else:
+            try:
+                with dataset.transaction():
+                    for token, update in detail_updates:
+                        n = (detail_model.update(update)
+                             .where(decode_pk(detail_model, token))
+                             .execute())
+                        if n != 1:
+                            raise WorksheetStale()
+                    for token, per in master_updates.items():
+                        update = {field: value for field, value in
+                                  per.values()}
+                        n = (master_model.update(update)
+                             .where(decode_pk(master_model, token))
+                             .execute())
+                        if n != 1:
+                            raise WorksheetStale()
+            except WorksheetStale:
+                flash('A row you edited was changed or removed elsewhere. '
+                      'Nothing was saved; the worksheet has been reloaded.',
+                      'danger')
+                return redirect(worksheet_url())
+            except ValueError:
+                flash('This worksheet is out of date. Nothing was saved; '
+                      'reload it before editing.', 'danger')
+                return redirect(worksheet_url())
+            except Exception as exc:
+                flash('Save failed and everything was rolled back: %s' %
+                      exc, 'danger')
+                app.logger.exception('Error saving worksheet.')
+            else:
+                flash('Saved changes to %d detail row(s) and %d master '
+                      'record(s).' % (len(detail_updates),
+                                      len(master_updates)), 'success')
+                return redirect(worksheet_url())
+
+    grid = _worksheet_grid(dataset, relation, columns, detail_model,
+                           master_model, page, ordering)
+    return render_template(
+        'worksheet.html',
+        allow_edit=allow_edit,
+        columns=columns,
+        detail_count=sum(1 for meta in columns if meta.side == 'd'),
+        errors=errors,
+        fk_column=fk_column,
+        form_action=worksheet_url(),
+        master_count=sum(1 for meta in columns if meta.side == 'm'),
+        master_pk_ok=master_pk_ok,
+        ordering=ordering,
+        relation=relation,
+        submitted=submitted,
+        table=table,
+        **grid)
 
 @app.route('/<table>/query/', methods=['GET', 'POST'])
 def table_query(table):

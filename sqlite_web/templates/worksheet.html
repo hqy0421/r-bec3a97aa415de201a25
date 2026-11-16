@@ -1,0 +1,111 @@
+{% extends "base_table.html" %}
+
+{% block join_tab_class %} active{% endblock %}
+
+{% block content_title %}
+  {{ super() }}
+  <small>worksheet: {{ relation.fk_column }} &rarr; {{ relation.master_table }}.{{ relation.master_column }} &middot; {{ total_rows }} rows</small>
+{% endblock %}
+
+{% block inner_content %}
+  <p class="small text-muted">
+    Joined worksheet over <code>{{ table }}.{{ relation.fk_column }}</code> &rarr; <code>{{ relation.master_table }}.{{ relation.master_column }}</code>.
+    Detail cells write only their own {{ table }} row; master cells write the shared {{ relation.master_table }} record, so every row
+    referencing it shows the change after saving. Only cells you edit are saved, and each save writes both sides in one transaction or not at all.
+    Type <code>NULL</code> for SQL NULL. Primary keys and the join key are read-only.
+  </p>
+  {% if not allow_edit %}
+    <div class="alert alert-warning">This database is read-only; the worksheet is browse-only.</div>
+  {% endif %}
+  {% if not master_pk_ok %}
+    <div class="alert alert-info">The master table has no usable primary key, so master columns are read-only.</div>
+  {% endif %}
+  {% if not rows %}
+    <p>Empty result set.</p>
+  {% else %}
+    {% if allow_edit %}
+    <form action="{{ form_action }}" id="worksheet-save" method="post">
+      {# The stamp stays disabled until JS enables it, so a browser without
+         JS cannot submit a full grid of untouched cells for rewriting. #}
+      <input name="stamp" type="hidden" value="{{ stamp }}" disabled />
+      {% for row in rows %}
+        <input name="k.{{ loop.index0 }}" type="hidden" value="{{ row.key }}" />
+        {% if row.mkey %}<input name="mk.{{ loop.index0 }}" type="hidden" value="{{ row.mkey }}" />{% endif %}
+      {% endfor %}
+    {% endif %}
+    <div class="table-wrapper">
+    <table class="table table-striped table-hover small cell-content table-worksheet">
+      <thead>
+        <tr class="worksheet-side">
+          <th colspan="{{ detail_count }}">Detail: {{ table }}</th>
+          <th class="master-col" colspan="{{ master_count }}">Master: {{ relation.master_table }}</th>
+        </tr>
+        <tr>
+          {% for col in columns %}
+            <th{% if col.side == 'm' %} class="master-col"{% endif %} data-col="{{ col.table }}.{{ col.column.name }}" title="{{ col.table }}.{{ col.column.name }}">
+              {% set target = (-loop.index if loop.index == ordering else loop.index) %}
+              <a href="{{ url_for('table_worksheet', table=table, fk_column=fk_column, ordering=target) }}">{{ col.column.name }}{% if ordering %}{% if loop.index == ordering %}&#9660;{% elif loop.index == -ordering %}&#9650;{% endif %}{% endif %}</a>
+              {% if col.column.primary_key %}<span class="text-muted" title="Primary key (read-only)">PK</span>{% endif %}
+              {% if col.side == 'd' and col.column.name == fk_column %}<span class="text-muted" title="Foreign key (read-only)">FK</span>{% endif %}
+              {% if col.side == 'm' and col.column.name == relation.master_column %}<span class="text-muted" title="Referenced column (read-only)">FK</span>{% endif %}
+            </th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+          {% set rn = loop.index0 %}
+          <tr>
+            {% for cell in row.cells %}
+              {% set col = columns[loop.index0] %}
+              {% set sent = submitted.get(rn, {}).get(col.index) %}
+              {% set err = errors.get(rn, {}).get(col.index) %}
+              <td{% if col.side == 'm' %} class="master-col"{% endif %}>
+                {% if cell.editable %}
+                  {% set val = sent if sent is not none else cell.edit %}
+                  {% if col.column.data_type.lower() in ('text', 'blob') %}
+                    <textarea class="form-control wk-cell{% if err %} is-invalid{% endif %}{% if sent is not none %} cell-dirty{% endif %}" name="c.{{ rn }}.{{ col.index }}" rows="1"{% if sent is not none %} data-dirty="1"{% endif %}>{{ val }}</textarea>
+                  {% else %}
+                    <input class="form-control wk-cell{% if err %} is-invalid{% endif %}{% if sent is not none %} cell-dirty{% endif %}" name="c.{{ rn }}.{{ col.index }}" value="{{ val }}"{% if sent is not none %} data-dirty="1"{% endif %} />
+                  {% endif %}
+                  {% if err %}<div class="invalid-feedback d-block">{{ err }}</div>{% endif %}
+                {% else %}
+                  {% if cell.value is none %}<code>NULL</code>{% else %}{{ cell.value|value_filter|safe }}{% endif %}
+                {% endif %}
+              </td>
+            {% endfor %}
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% if allow_edit %}
+      <div class="mb-3">
+        <button class="btn btn-primary" type="submit">Save changes</button>
+        <span class="small text-muted">Only edited cells are written.</span>
+      </div>
+    </form>
+    {% endif %}
+    <nav>
+      <ul class="pagination">
+        {# Disabled arrows render as spans, an anchor without a page value
+           would silently navigate to page 1. #}
+        <li class="{% if not previous_page %}disabled {% endif %}page-item">
+          {% if previous_page %}<a class="page-link" href="{{ url_for('table_worksheet', table=table, fk_column=fk_column, page=1, ordering=ordering) }}">&laquo;</a>{% else %}<span class="page-link">&laquo;</span>{% endif %}
+        </li>
+        <li class="{% if not previous_page %}disabled {% endif %}page-item">
+          {% if previous_page %}<a class="page-link" href="{{ url_for('table_worksheet', table=table, fk_column=fk_column, page=previous_page, ordering=ordering) }}">&lsaquo;</a>{% else %}<span class="page-link">&lsaquo;</span>{% endif %}
+        </li>
+        <li class="page-item disabled">
+          <span class="page-link">Page {{ page }} / {{ total_pages }}</span>
+        </li>
+        <li class="{% if not next_page %}disabled {% endif %}page-item">
+          {% if next_page %}<a class="page-link" href="{{ url_for('table_worksheet', table=table, fk_column=fk_column, page=next_page, ordering=ordering) }}">&rsaquo;</a>{% else %}<span class="page-link">&rsaquo;</span>{% endif %}
+        </li>
+        <li class="{% if not next_page %}disabled {% endif %}page-item">
+          {% if next_page %}<a class="page-link" href="{{ url_for('table_worksheet', table=table, fk_column=fk_column, page=total_pages, ordering=ordering) }}">&raquo;</a>{% else %}<span class="page-link">&raquo;</span>{% endif %}
+        </li>
+      </ul>
+    </nav>
+  {% endif %}
+{% endblock %}
